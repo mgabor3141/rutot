@@ -12,3 +12,7 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# The solver is a workspace member, so "*" doesn't cover it; keep it fast in dev.
+[profile.dev.package.rutot-core]
+opt-level = 3
