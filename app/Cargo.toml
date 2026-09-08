@@ -1,0 +1,11 @@
+[package]
+name = "rutot"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+rutot-core = { path = "../core" }
+bevy = { version = "0.19", default-features = false, features = ["2d", "ui", "default_font"] }
+
+[features]
+dev = ["bevy/dynamic_linking"]
