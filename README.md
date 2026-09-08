@@ -2,6 +2,8 @@
 
 A prototype testing one idea: **the yard is a machine.**
 
+![Hewn Cedar: the Inglenook as a wooden tabletop diorama](docs/hewn-cedar-inglenook.jpg)
+
 Cars go in as ingredients, a consist comes out as the product, and a
 deterministic search is the crafting animation. The player designs the yard
 topology (sidings, capacities, headshunt length); the game finds the shunting
@@ -28,7 +30,20 @@ than like watching the game play itself.
   - `bin/yardbench.rs`: compare topologies by mean optimal plan cost.
 - `app/` — Bevy 0.19 visualiser. 30 Hz `FixedUpdate` simulation, rendering
   interpolated with `Time<Fixed>::overstep_fraction`. Planning runs on a
-  background thread.
+  background thread. Two presentation layers share the sim:
+  - `view3d.rs` — **"Hewn Cedar"** (default): a wooden tabletop diorama.
+    Procedural plank-and-grain wood shader (`shaders/wood.wgsl`, a
+    `MaterialExtension` over `StandardMaterial`), cork roadbed, walnut
+    sleepers, tin rails, chunky hand-hewn cars with a little per-car askew,
+    a deep-red loco with brass trim, a headlamp and smoke. Lit by a warm
+    sun with cascaded shadows, a `RectLight` standing in for the window, a
+    cool bounce, and a runtime-generated room cubemap for reflections.
+    Post: SSAO, SMAA, bloom, distance fog, and a tilt-shift `DepthOfField`
+    so the whole thing reads as a miniature. Labels are UI text projected
+    from world space. Drag to orbit, wheel to zoom.
+  - `view2d.rs` — the schematic view (`RUTOT_VIEW=2d`).
+
+![Timesaver mid run-round](docs/hewn-cedar-timesaver.jpg)
 
 ## Run
 
@@ -37,13 +52,15 @@ cargo run -p rutot --features dev            # visualiser (dynamic linking for f
 cargo run -p rutot-core --release --bin yardbench 200
 cargo test -p rutot-core --release
 
+RUTOT_VIEW=2d cargo run -p rutot --features dev                        # schematic view
 RUTOT_YARD=4 RUTOT_SEED=7 cargo run -p rutot --features dev            # pick yard / seed
+RUTOT_FSTOP=0.3 cargo run -p rutot --features dev                      # stronger tilt-shift
 RUTOT_SHOT_AFTER=6 cargo run -p rutot --features dev                   # screenshot + exit
 RUTOT_SHOT_PHASE="round the loop" RUTOT_SHOT_PHASE_TICKS=30 cargo run -p rutot --features dev
 ```
 
 Controls: `space` pause · `1/2/3` speed · `R` new task · `Y` next yard ·
-`A` auto-advance · `P` screenshot.
+`A` auto-advance · `P` screenshot · drag to orbit · wheel to zoom.
 
 ## First numbers
 
