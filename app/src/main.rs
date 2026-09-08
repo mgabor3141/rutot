@@ -7,7 +7,8 @@ use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::sprite::Anchor;
 use rutot_core::{
-    benchmark, car_label, random_task, solve, CarId, Goal, Layout, Move, Pose, Rng, Sim, State, Yard, YardStats, P2,
+    benchmark, car_label, random_task, solve, CarId, Goal, Layout, Move, Pose, Rng, Side, Sim, State, Yard, YardStats,
+    P2,
 };
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Mutex;
@@ -36,8 +37,16 @@ const CAR_COLORS: [Color; 10] = [
 ];
 
 fn yards() -> Vec<Yard> {
-    vec![Yard::inglenook(), Yard::inglenook_long_lead(), Yard::inglenook_four()]
+    vec![
+        Yard::inglenook(),
+        Yard::inglenook_long_lead(),
+        Yard::inglenook_four(),
+        Yard::inglenook_with_loop(),
+        Yard::timesaver(),
+    ]
 }
+
+type Planned = (Sim, usize, Duration);
 
 // ---------------------------------------------------------------- resources
 
@@ -52,6 +61,42 @@ struct Session {
     plan_time: Duration,
     /// Ticks spent finished before auto-advancing.
     finished_for: u32,
+    /// A task being solved on another thread (Mutex only for `Sync`).
+    planning: Option<Mutex<Receiver<Planned>>>,
+}
+
+impl Session {
+    fn request_task(&mut self) {
+        if self.planning.is_some() {
+            return;
+        }
+        let yards = self.yards.clone();
+        let idx = self.yard_idx;
+        let mut rng = Rng::new(self.rng.next_u64());
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(new_task(&yards, idx, &mut rng));
+        });
+        self.planning = Some(Mutex::new(rx));
+    }
+
+    /// Install a finished plan if one has arrived. Returns true if it did.
+    fn take_planned(&mut self) -> bool {
+        let Some(rx) = &self.planning else { return false };
+        let got = rx.lock().unwrap().try_recv();
+        match got {
+            Ok((sim, n, t)) => {
+                self.sim = sim;
+                self.plan_states = n;
+                self.plan_time = t;
+                self.task_no += 1;
+                self.finished_for = 0;
+                self.planning = None;
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -70,9 +115,18 @@ struct Stats {
 #[derive(Resource, Default)]
 struct Rebuild(bool);
 
-/// `RUTOT_SHOT_AFTER=<secs>` takes a screenshot then exits; handy for CI/agents.
+/// `RUTOT_SHOT_AFTER=<secs>` takes a screenshot then exits; handy for
+/// CI/agents. `RUTOT_SHOT_PHASE=<phase name>` instead fires a little way
+/// into the first occurrence of that sim phase (e.g. "round the loop").
 #[derive(Resource)]
-struct AutoShot { at: f32, taken: bool, shots: u32 }
+struct AutoShot {
+    at: f32,
+    phase: Option<String>,
+    phase_ticks: u32,
+    taken: bool,
+    taken_at: f32,
+    shots: u32,
+}
 
 // --------------------------------------------------------------- components
 
@@ -129,8 +183,22 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
     a + d * t
 }
 
+/// Cars are symmetric; keep their lettering upright by folding headings
+/// into (-90°, 90°].
+fn upright(h: f32) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let mut h = h;
+    while h > FRAC_PI_2 {
+        h -= PI;
+    }
+    while h <= -FRAC_PI_2 {
+        h += PI;
+    }
+    h
+}
+
 fn pose_transform(p: Pose, z: f32) -> Transform {
-    Transform::from_xyz(p.pos.x, p.pos.y, z).with_rotation(Quat::from_rotation_z(p.heading))
+    Transform::from_xyz(p.pos.x, p.pos.y, z).with_rotation(Quat::from_rotation_z(upright(p.heading)))
 }
 
 fn car_color(c: CarId) -> Color {
@@ -141,9 +209,11 @@ fn car_color(c: CarId) -> Color {
 
 fn main() {
     let yards = yards();
-    let mut rng = Rng::new(0x5eed);
-    let (sim, plan_states, plan_time) = new_task(&yards, 0, &mut rng);
     let n = yards.len();
+    let yard_idx = std::env::var("RUTOT_YARD").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(n - 1);
+    let seed = std::env::var("RUTOT_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0x5eed);
+    let mut rng = Rng::new(seed);
+    let (sim, plan_states, plan_time) = new_task(&yards, yard_idx, &mut rng);
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -158,20 +228,24 @@ fn main() {
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .insert_resource(Session {
             yards,
-            yard_idx: 0,
+            yard_idx,
             rng,
             task_no: 1,
             sim,
             plan_states,
             plan_time,
             finished_for: 0,
+            planning: None,
         })
         .insert_resource(Playback { paused: false, speed: 1, auto: true })
         .insert_resource(Stats { by_yard: vec![None; n], inflight: Mutex::new(None) })
         .insert_resource(Rebuild(true))
         .insert_resource(AutoShot {
             at: std::env::var("RUTOT_SHOT_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(-1.0),
+            phase: std::env::var("RUTOT_SHOT_PHASE").ok(),
+            phase_ticks: 0,
             taken: false,
+            taken_at: 0.0,
             shots: 0,
         })
         .add_systems(Startup, setup)
@@ -189,7 +263,10 @@ fn setup(mut commands: Commands, session: Res<Session>) {
     let cy = (lo.y + hi.y) * 0.5 - 30.0;
     commands.spawn((
         Camera2d,
-        Projection::Orthographic(OrthographicProjection { scale: 0.62, ..OrthographicProjection::default_2d() }),
+        Projection::Orthographic(OrthographicProjection {
+            scale: fit_scale(&session.sim.layout, 1280.0),
+            ..OrthographicProjection::default_2d()
+        }),
         Transform::from_xyz(cx, cy, 0.0),
     ));
 
@@ -209,7 +286,8 @@ fn handle_input(
     mut session: ResMut<Session>,
     mut playback: ResMut<Playback>,
     mut rebuild: ResMut<Rebuild>,
-    mut camera: Query<&mut Transform, With<Camera2d>>,
+    mut camera: Query<(&mut Transform, &mut Projection), With<Camera2d>>,
+    window: Query<&Window>,
 ) {
     if keys.just_pressed(KeyCode::Space) {
         playback.paused = !playback.paused;
@@ -232,21 +310,24 @@ fn handle_input(
         new_task_wanted = true;
     }
     if new_task_wanted {
-        let idx = session.yard_idx;
-        let Session { yards, rng, .. } = &mut *session;
-        let (sim, n, t) = new_task(yards, idx, rng);
-        session.sim = sim;
-        session.plan_states = n;
-        session.plan_time = t;
-        session.task_no += 1;
-        session.finished_for = 0;
+        session.request_task();
+    }
+    if session.take_planned() {
         rebuild.0 = true;
-        if let Ok(mut cam) = camera.single_mut() {
+        if let Ok((mut cam, mut proj)) = camera.single_mut() {
             let (lo, hi) = session.sim.layout.bounds();
             cam.translation.x = (lo.x + hi.x) * 0.5;
             cam.translation.y = (lo.y + hi.y) * 0.5 - 30.0;
+            if let Projection::Orthographic(o) = &mut *proj {
+                o.scale = fit_scale(&session.sim.layout, window.single().map(|w| w.width()).unwrap_or(1280.0));
+            }
         }
     }
+}
+
+fn fit_scale(layout: &Layout, window_w: f32) -> f32 {
+    let (lo, hi) = layout.bounds();
+    ((hi.x - lo.x + 260.0) / window_w).max(0.55)
 }
 
 fn rebuild_entities(
@@ -306,7 +387,7 @@ fn rebuild_entities(
     let layout = &session.sim.layout;
     let goal = &session.sim.goal;
     let y = -PITCH * 1.6;
-    let x0 = -layout.head_len() + CAR_LEN * 0.5;
+    let x0 = -layout.main_len() + CAR_LEN * 0.5;
     commands.spawn((
         Text2d::new(format!("build on #{}:", goal.siding)),
         TextFont { font_size: FontSize::Px(14.0), ..default() },
@@ -336,7 +417,6 @@ fn rebuild_entities(
 fn step_sim(
     mut session: ResMut<Session>,
     playback: Res<Playback>,
-    mut rebuild: ResMut<Rebuild>,
     mut movers: Query<(&mut Interp, Option<&Loco>, Option<&Car>)>,
 ) {
     if playback.paused {
@@ -351,16 +431,7 @@ fn step_sim(
     if session.sim.finished() {
         session.finished_for += playback.speed;
         if playback.auto && session.finished_for > (TICK_HZ as u32) * 2 {
-            let idx = session.yard_idx;
-            let Session { yards, rng, .. } = &mut *session;
-            let (sim, n, t) = new_task(yards, idx, rng);
-            session.sim = sim;
-            session.plan_states = n;
-            session.plan_time = t;
-            session.task_no += 1;
-            session.finished_for = 0;
-            rebuild.0 = true;
-            return;
+            session.request_task();
         }
     }
     let snap = session.sim.snapshot();
@@ -380,7 +451,7 @@ fn render_interpolated(fixed: Res<Time<Fixed>>, mut q: Query<(&Interp, &mut Tran
         let c = it.curr.pos;
         tf.translation.x = p.x + (c.x - p.x) * a;
         tf.translation.y = p.y + (c.y - p.y) * a;
-        tf.rotation = Quat::from_rotation_z(lerp_angle(it.prev.heading, it.curr.heading, a));
+        tf.rotation = Quat::from_rotation_z(lerp_angle(upright(it.prev.heading), upright(it.curr.heading), a));
     }
 }
 
@@ -427,7 +498,10 @@ fn spawn_track(commands: &mut Commands, session: &Session) {
         }
     };
 
-    strip(&layout.headshunt, rail);
+    strip(&layout.main, rail);
+    if let Some(lp) = &layout.loop_track {
+        strip(lp, Color::srgb(0.42, 0.55, 0.62));
+    }
     for (i, sd) in layout.sidings.iter().enumerate() {
         strip(sd, if i == goal.siding { goal_rail } else { rail });
     }
@@ -440,27 +514,40 @@ fn spawn_track(commands: &mut Commands, session: &Session) {
             Track,
         ));
     };
-    marker(v2(layout.headshunt.pts[0]));
+    if !yard.has_side(Side::Left) {
+        marker(v2(layout.throat(Side::Left)));
+    }
+    if !yard.has_side(Side::Right) {
+        marker(v2(layout.throat(Side::Right)));
+    }
     for sd in &layout.sidings {
         marker(v2(*sd.pts.last().unwrap()));
     }
+    let dim = Color::srgb(0.6, 0.6, 0.65);
     for (i, sd) in layout.sidings.iter().enumerate() {
         let end = v2(*sd.pts.last().unwrap());
+        let (anchor, dx) = match yard.sidings[i].side {
+            Side::Right => (Anchor::CENTER_LEFT, 10.0),
+            Side::Left => (Anchor::CENTER_RIGHT, -10.0),
+        };
         commands.spawn((
             Text2d::new(format!("#{i} {} ({})", yard.sidings[i].name, yard.sidings[i].capacity)),
             TextFont { font_size: FontSize::Px(12.0), ..default() },
-            TextColor(if i == goal.siding { goal_rail } else { Color::srgb(0.6, 0.6, 0.65) }),
-            TextLayout::justify(Justify::Left),
-            Anchor::CENTER_LEFT,
-            Transform::from_translation((end + Vec2::new(10.0, 0.0)).extend(0.3)),
+            TextColor(if i == goal.siding { goal_rail } else { dim }),
+            anchor,
+            Transform::from_translation((end + Vec2::new(dx, 0.0)).extend(0.3)),
             Track,
         ));
     }
-    let hs = v2(layout.headshunt.pts[0]);
+    let hs = v2(layout.throat(Side::Left));
     commands.spawn((
-        Text2d::new(format!("headshunt (loco + {})", yard.headshunt)),
+        Text2d::new(format!(
+            "main (loco + {}){}",
+            yard.headshunt,
+            if yard.runaround { "   run-round loop above" } else { "" }
+        )),
         TextFont { font_size: FontSize::Px(12.0), ..default() },
-        TextColor(Color::srgb(0.6, 0.6, 0.65)),
+        TextColor(dim),
         Anchor::CENTER_LEFT,
         Transform::from_translation((hs + Vec2::new(0.0, -PITCH * 0.55)).extend(0.3)),
         Track,
@@ -516,14 +603,20 @@ fn update_hud(session: Res<Session>, playback: Res<Playback>, stats: Res<Stats>,
     let plan_len = sim.plan.len();
     let mv = match sim.current_move() {
         Some(m) => format!("move {}/{}: {}  ({})", sim.step + 1, plan_len, describe(m, yard), sim.phase_name()),
+        None if session.planning.is_some() => "planning next task...".to_string(),
         None => format!("done in {plan_len} moves - {}", if playback.auto { "next task shortly" } else { "[R] for a new task" }),
     };
+    let legs = rutot_core::plan_cost(&sim.plan);
+    let rounds = sim.plan.iter().filter(|m| **m == Move::RunAround).count();
     let stat = match &stats.by_yard[session.yard_idx] {
         Some(s) => format!(
-            "{} random tasks: mean {:.1} moves, max {}, {:.0} ms/solve",
+            "{} random tasks: mean {:.1} moves / {:.1} legs, {:.1} run-rounds, max {} moves, {} unsolved, {:.0} ms/solve",
             s.tasks,
             s.mean_moves(),
+            s.mean_cost(),
+            s.mean_run_arounds(),
             s.max_moves,
+            s.tasks - s.solved,
             s.elapsed.as_secs_f64() * 1000.0 / s.tasks as f64
         ),
         None => "computing yard statistics...".to_string(),
@@ -535,8 +628,14 @@ fn update_hud(session: Res<Session>, playback: Res<Playback>, stats: Res<Stats>,
         .map(|(i, y)| {
             let mark = if i == session.yard_idx { ">" } else { " " };
             match &stats.by_yard[i] {
-                Some(s) => format!("{mark} {:<28} mean {:>5.1}  max {:>2}", y.name, s.mean_moves(), s.max_moves),
-                None => format!("{mark} {:<28} ...", y.name),
+                Some(s) => format!(
+                    "{mark} {:<38} {:>5.1} legs  {:>4.1} moves  {:>3.1} rounds",
+                    y.name,
+                    s.mean_cost(),
+                    s.mean_moves(),
+                    s.mean_run_arounds()
+                ),
+                None => format!("{mark} {:<38} ...", y.name),
             }
         })
         .collect();
@@ -545,18 +644,20 @@ fn update_hud(session: Res<Session>, playback: Res<Playback>, stats: Res<Stats>,
         "rutot - the yard is a machine\n\
          \n\
          yard: {}      task #{}\n\
-         plan: {} moves, optimal  ({} states searched in {:.1} ms)\n\
+         plan: {} moves = {} legs ({} run-rounds), optimal  ({} states searched in {:.1} ms)\n\
          {}\n\
          {}\n\
          \n\
          {}\n\
          \n\
-         yard throughput (recipe time):\n{}\n\
+         yard throughput (recipe time, lower is better):\n{}\n\
          \n\
          [space] {}   [1/2/3] speed x{}   [R] new task   [Y] next yard   [A] auto {}   [P] screenshot   30 Hz sim, interpolated render",
         yard.name,
         session.task_no,
         plan_len,
+        legs,
+        rounds,
         session.plan_states,
         session.plan_time.as_secs_f64() * 1000.0,
         mv,
@@ -573,24 +674,38 @@ fn screenshots(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
+    session: Res<Session>,
     mut auto: ResMut<AutoShot>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let mut take = keys.just_pressed(KeyCode::KeyP);
-    let mut then_exit = false;
-    if auto.at >= 0.0 && !auto.taken && time.elapsed_secs() >= auto.at {
-        auto.taken = true;
-        take = true;
-        then_exit = true;
+    let automatic = auto.at >= 0.0 || auto.phase.is_some();
+    if automatic && !auto.taken {
+        let timed = auto.at >= 0.0 && time.elapsed_secs() >= auto.at;
+        let phased = match &auto.phase {
+            Some(p) if session.sim.phase_name() == p => {
+                // Count sim ticks, not frames.
+                if auto.phase_ticks == 0 {
+                    auto.phase_ticks = session.sim.ticks as u32;
+                }
+                let want: u64 = std::env::var("RUTOT_SHOT_PHASE_TICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+                session.sim.ticks - auto.phase_ticks as u64 >= want
+            }
+            _ => false,
+        };
+        if timed || phased {
+            auto.taken = true;
+            auto.taken_at = time.elapsed_secs();
+            take = true;
+        }
     }
-    if auto.taken && auto.at >= 0.0 && time.elapsed_secs() >= auto.at + 1.5 {
+    if automatic && auto.taken && time.elapsed_secs() >= auto.taken_at + 1.5 {
         exit.write(AppExit::Success);
     }
     if take {
         auto.shots += 1;
         let path = format!("rutot-{:03}.png", auto.shots);
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
-        let _ = then_exit;
     }
 }
 
@@ -599,6 +714,7 @@ fn describe(m: Move, yard: &Yard) -> String {
     match m {
         Move::Pull { siding, count } => format!("pull {count} from {} (#{siding})", name(siding)),
         Move::Push { siding, count } => format!("push {count} onto {} (#{siding})", name(siding)),
+        Move::RunAround => "run round the string".to_string(),
     }
 }
 

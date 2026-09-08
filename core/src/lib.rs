@@ -8,4 +8,4 @@ pub mod yard;
 pub use layout::{Layout, Polyline, P2};
 pub use sim::{Pose, Sim, SimSnapshot};
 pub use solver::{benchmark, random_task, solve, Plan, Rng, SolveError, YardStats};
-pub use yard::{car_label, CarId, Goal, Move, Siding, SidingId, State, Yard};
+pub use yard::{car_label, plan_cost, CarId, Goal, Move, Side, Siding, SidingId, State, Yard};

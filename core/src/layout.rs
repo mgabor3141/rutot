@@ -1,11 +1,18 @@
 //! Geometry for drawing a yard: polylines in a plain 2D space, no engine
-//! types. The throat (where the headshunt meets the ladder) is the origin.
+//! types.
 //!
-//! Every siding gets a *path*: headshunt far end → throat → siding stop block.
-//! A vehicle string on the move is described by one scalar `s` along the
-//! active path; `s = 0` is the far end of the headshunt.
+//! The *main* runs from `(-main_len, 0)` (left throat) to `(0, 0)` (right
+//! throat). Right-hand sidings fan up-right from the right throat, left-hand
+//! sidings fan up-left from the left throat, and the run-round loop (if any)
+//! arcs over the main between the two throats.
+//!
+//! Every siding gets a *path*: from the far end of the main, through the
+//! near throat, into the siding. A string on the move is one scalar `s`
+//! along the active path with the loco at `s` and cars trailing at
+//! `s + (i+1)·car_len`; that holds for either side because `held` is ordered
+//! loco-first.
 
-use crate::yard::Yard;
+use crate::yard::{Side, Yard};
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct P2 {
@@ -63,57 +70,125 @@ impl Polyline {
         pts.extend(other.pts.iter().skip(1).copied());
         Polyline::new(pts)
     }
+    pub fn reversed(&self) -> Polyline {
+        let mut pts = self.pts.clone();
+        pts.reverse();
+        Polyline::new(pts)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub car_len: f32,
-    /// Far end → throat.
-    pub headshunt: Polyline,
+    /// Left throat → right throat.
+    pub main: Polyline,
     /// Throat → stop block, one per siding.
     pub sidings: Vec<Polyline>,
-    /// `headshunt.join(sidings[i])`.
+    /// Far end of main → near throat → siding, one per siding.
     pub paths: Vec<Polyline>,
+    /// Left throat → over the top → right throat, if the yard has a loop.
+    pub loop_track: Option<Polyline>,
     /// Distance from the start of the siding polyline to the first slot's
-    /// leading edge (i.e. the diagonal plus a little buffer).
+    /// leading edge (the diagonal plus a little buffer).
     siding_start: Vec<f32>,
 }
 
 impl Layout {
-    /// A ladder fanning upward from the throat at `angle_deg`. Siding 0 runs
-    /// straight on; each further siding branches one `pitch` higher.
+    /// Ladders fanning upward from each throat at `angle_deg`. Siding index
+    /// 0 on each side runs straight on; each further siding branches one
+    /// `pitch` higher.
     pub fn ladder(yard: &Yard, car_len: f32, pitch: f32, angle_deg: f32) -> Layout {
-        let head_len = (yard.headshunt as f32 + 1.5) * car_len;
-        let headshunt = Polyline::new(vec![P2::new(-head_len, 0.0), P2::new(0.0, 0.0)]);
+        // Cells 0..=H+1: room for the loco at either end plus H cars.
+        let main_len = (yard.headshunt as f32 + 2.0) * car_len;
+        let main = Polyline::new(vec![P2::new(-main_len, 0.0), P2::new(0.0, 0.0)]);
         let tan = angle_deg.to_radians().tan();
         let buffer = 0.5 * car_len;
+
         let mut sidings = Vec::new();
         let mut siding_start = Vec::new();
-        for (i, sd) in yard.sidings.iter().enumerate() {
-            let y = i as f32 * pitch;
+        let mut rank = [0usize; 2];
+        for sd in &yard.sidings {
+            let (throat, dir, r) = match sd.side {
+                Side::Right => (P2::new(0.0, 0.0), 1.0, &mut rank[1]),
+                Side::Left => (P2::new(-main_len, 0.0), -1.0, &mut rank[0]),
+            };
+            let y = *r as f32 * pitch;
+            *r += 1;
             let x0 = if tan > 0.0 { y / tan } else { 0.0 };
             let run = buffer + sd.capacity as f32 * car_len;
-            let mut pts = vec![P2::new(0.0, 0.0)];
-            if i > 0 {
-                pts.push(P2::new(x0, y));
+            let mut pts = vec![throat];
+            if y > 0.0 {
+                pts.push(P2::new(throat.x + dir * x0, y));
             }
-            pts.push(P2::new(x0 + run, y));
+            pts.push(P2::new(throat.x + dir * (x0 + run), y));
             let pl = Polyline::new(pts);
             siding_start.push(pl.length() - sd.capacity as f32 * car_len);
             sidings.push(pl);
         }
-        let paths = sidings.iter().map(|s| headshunt.join(s)).collect();
-        Layout { car_len, headshunt, sidings, paths, siding_start }
+
+        let paths = yard
+            .sidings
+            .iter()
+            .zip(&sidings)
+            .map(|(sd, pl)| match sd.side {
+                Side::Right => main.join(pl),
+                Side::Left => main.reversed().join(pl),
+            })
+            .collect();
+
+        let loop_track = yard.runaround.then(|| {
+            // Sits one pitch above the main, clear of the (outward) ladders.
+            let y = pitch;
+            let dx = if tan > 0.0 { y / tan } else { 0.0 };
+            Polyline::new(vec![
+                P2::new(-main_len, 0.0),
+                P2::new(-main_len + dx, y),
+                P2::new(-dx, y),
+                P2::new(0.0, 0.0),
+            ])
+        });
+
+        Layout { car_len, main, sidings, paths, loop_track, siding_start }
     }
 
-    pub fn head_len(&self) -> f32 {
-        self.headshunt.length()
+    pub fn main_len(&self) -> f32 {
+        self.main.length()
+    }
+
+    /// The main oriented away from `side` (the loco's side), so `s = 0` is
+    /// the loco's rest end.
+    pub fn main_from(&self, side: Side) -> Polyline {
+        match side {
+            Side::Left => self.main.clone(),
+            Side::Right => self.main.reversed(),
+        }
+    }
+
+    pub fn throat(&self, side: Side) -> P2 {
+        match side {
+            Side::Left => self.main.pts[0],
+            Side::Right => *self.main.pts.last().unwrap(),
+        }
+    }
+
+    /// Loco path for a run-round starting from rest on `from`: out through
+    /// the near throat, over the loop, arriving at the far throat.
+    pub fn loop_path(&self, from: Side) -> Option<Polyline> {
+        let lp = self.loop_track.as_ref()?;
+        let rest = self.main_from(from).point_at(self.rest_s());
+        let over = match from {
+            Side::Left => lp.clone(),
+            Side::Right => lp.reversed(),
+        };
+        let mut pts = vec![rest];
+        pts.extend(over.pts.iter().copied());
+        Some(Polyline::new(pts))
     }
 
     /// Path distance (along `paths[siding]`) of the centre of `slot`, where
     /// slot 0 is nearest the ladder and slot `capacity-1` is at the stop block.
     pub fn slot_s(&self, siding: usize, slot: usize) -> f32 {
-        self.head_len() + self.siding_start[siding] + (slot as f32 + 0.5) * self.car_len
+        self.main_len() + self.siding_start[siding] + (slot as f32 + 0.5) * self.car_len
     }
 
     pub fn slot_pose(&self, siding: usize, slot: usize) -> (P2, f32) {
@@ -121,8 +196,7 @@ impl Layout {
         (self.paths[siding].point_at(s), self.paths[siding].heading_at(s))
     }
 
-    /// Loco rest position on the headshunt (its centre), string trailing
-    /// toward the throat.
+    /// Loco rest position (its centre) measured from its own end of the main.
     pub fn rest_s(&self) -> f32 {
         0.5 * self.car_len
     }
@@ -130,7 +204,13 @@ impl Layout {
     pub fn bounds(&self) -> (P2, P2) {
         let mut lo = P2::new(f32::MAX, f32::MAX);
         let mut hi = P2::new(f32::MIN, f32::MIN);
-        for p in self.headshunt.pts.iter().chain(self.sidings.iter().flat_map(|s| s.pts.iter())) {
+        let all = self
+            .main
+            .pts
+            .iter()
+            .chain(self.sidings.iter().flat_map(|s| s.pts.iter()))
+            .chain(self.loop_track.iter().flat_map(|l| l.pts.iter()));
+        for p in all {
             lo.x = lo.x.min(p.x);
             lo.y = lo.y.min(p.y);
             hi.x = hi.x.max(p.x);
@@ -156,12 +236,28 @@ mod tests {
 
     #[test]
     fn slots_are_spaced_by_car_len_and_end_at_stop_block() {
-        let y = Yard::inglenook();
-        let l = Layout::ladder(&y, 40.0, 36.0, 30.0);
-        for (i, sd) in y.sidings.iter().enumerate() {
-            let last = l.slot_s(i, sd.capacity - 1);
-            assert!((last + 20.0 - l.paths[i].length()).abs() < 1e-3, "siding {i} last slot flush");
-            assert!((l.slot_s(i, 1) - l.slot_s(i, 0) - 40.0).abs() < 1e-3);
+        for y in [Yard::inglenook(), Yard::timesaver()] {
+            let l = Layout::ladder(&y, 40.0, 36.0, 30.0);
+            for (i, sd) in y.sidings.iter().enumerate() {
+                let last = l.slot_s(i, sd.capacity - 1);
+                assert!((last + 20.0 - l.paths[i].length()).abs() < 1e-3, "{}: siding {i} last slot flush", y.name);
+                assert!((l.slot_s(i, 1) - l.slot_s(i, 0) - 40.0).abs() < 1e-3);
+            }
         }
+    }
+
+    #[test]
+    fn left_sidings_are_mirrored_and_paths_start_at_the_far_end() {
+        let y = Yard::timesaver();
+        let l = Layout::ladder(&y, 40.0, 36.0, 30.0);
+        let (p, _) = l.slot_pose(2, 0); // "Long", left side
+        assert!(p.x < -l.main_len(), "left siding lies beyond the left throat: {p:?}");
+        assert_eq!(l.paths[2].pts[0], P2::new(0.0, 0.0), "left-siding path starts at the right end");
+        assert_eq!(l.paths[0].pts[0], P2::new(-l.main_len(), 0.0));
+        let lp = l.loop_path(Side::Left).unwrap();
+        assert_eq!(*lp.pts.last().unwrap(), l.throat(Side::Right));
+        let lp = l.loop_path(Side::Right).unwrap();
+        assert_eq!(*lp.pts.last().unwrap(), l.throat(Side::Left));
+        assert!(Layout::ladder(&Yard::inglenook(), 40.0, 36.0, 30.0).loop_path(Side::Left).is_none());
     }
 }
